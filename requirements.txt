@@ -1,0 +1,16 @@
+langchain
+langchain-groq
+langchain-community
+langchain-core
+langchain-huggingface
+langgraph
+faiss-cpu
+sentence-transformers
+python-dotenv
+fastapi
+uvicorn
+streamlit
+pydantic
+sqlalchemy
+python-multipart
+langsmith
