@@ -11,9 +11,6 @@ from langchain_core.messages import HumanMessage, AIMessage, AnyMessage, SystemM
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from dotenv import load_dotenv
-import sqlite3
-
-os.makedirs("data", exist_ok=True)
 
 from knowledge_base import search_knowledge_base
 from database import SessionLocal, Ticket, CustomerMemory, InteractionLog, init_db
@@ -302,8 +299,20 @@ def generate_response(state: SupportState) -> dict:
 # ── Node 5: Create Ticket ─────────────────────────────────────────────────────
 
 def create_ticket(state: SupportState) -> dict:
-    """Create a support ticket in the database"""
+    """Create a support ticket in the database.
+
+    Runs FIRST in both the escalate and no-escalate paths (see graph wiring
+    in build_support_agent). Determines its own escalation decision by
+    calling should_escalate() directly, rather than relying on an
+    "escalated" key already being in state — at this point in the graph,
+    if we're on the escalation path, escalate() hasn't run yet, so
+    state.get("escalated") would still be None/falsy if we trusted it
+    blindly. Computing it explicitly here keeps the ticket's escalated
+    flag correct regardless of node execution order.
+    """
     print(f"🎫 Creating ticket...")
+
+    will_escalate = should_escalate(state) == "escalate"
 
     db = SessionLocal()
     try:
@@ -329,11 +338,11 @@ def create_ticket(state: SupportState) -> dict:
             full_conversation=full_conv,
             category=state.get("intent", "general"),
             priority=state.get("priority", "medium"),
-            status="resolved" if state.get("resolved") else "open",
+            status="escalated" if will_escalate else ("resolved" if state.get("resolved") else "open"),
             resolution=state.get("resolution", ""),
             confidence_score=state.get("confidence", 0.5),
-            escalated=1 if state.get("escalated") else 0,
-            resolved_at=datetime.utcnow() if state.get("resolved") else None
+            escalated=1 if will_escalate else 0,
+            resolved_at=datetime.utcnow() if (state.get("resolved") and not will_escalate) else None
         )
         db.add(ticket)
 
@@ -342,7 +351,7 @@ def create_ticket(state: SupportState) -> dict:
             ticket_id=ticket_id,
             customer_id=state["customer_id"],
             role="system",
-            message=f"Ticket created. Intent: {state.get('intent')}. Priority: {state.get('priority')}. Resolved: {state.get('resolved')}",
+            message=f"Ticket created. Intent: {state.get('intent')}. Priority: {state.get('priority')}. Resolved: {state.get('resolved')}. Will escalate: {will_escalate}",
             node="create_ticket"
         )
         db.add(log)
@@ -351,7 +360,7 @@ def create_ticket(state: SupportState) -> dict:
         # Update customer memory
         update_customer_memory(state["customer_id"], state, state.get("resolved", False))
 
-        print(f"✅ Ticket created: {ticket_id}")
+        print(f"✅ Ticket created: {ticket_id} (escalating: {will_escalate})")
         return {"ticket_id": ticket_id}
 
     finally:
@@ -360,22 +369,20 @@ def create_ticket(state: SupportState) -> dict:
 # ── Node 6: Escalate ──────────────────────────────────────────────────────────
 
 def escalate(state: SupportState) -> dict:
-    """Escalate to human agent"""
+    """Escalate to human agent.
+
+    Runs AFTER create_ticket in the graph now (see build_support_agent),
+    so state["ticket_id"] is always a real value here, not None — that was
+    the root cause of "Your ticket ID is None" in escalation messages.
+    create_ticket already set status="escalated" and escalated=1 on the
+    row, so this function's job is just to log the specific reason and
+    produce the customer-facing message — not to re-fetch/re-mutate the
+    ticket.
+    """
     print(f"🚨 Escalating to human agent...")
 
     db = SessionLocal()
     try:
-        # Update ticket if exists
-        if state.get("ticket_id"):
-            ticket = db.query(Ticket).filter(
-                Ticket.ticket_id == state["ticket_id"]
-            ).first()
-            if ticket:
-                ticket.status = "escalated"
-                ticket.escalated = 1
-                ticket.priority = "high" if ticket.priority == "low" else ticket.priority
-
-        # Determine escalation reason
         reasons = []
         if state.get("confidence", 1.0) < 0.4:
             reasons.append("low agent confidence")
@@ -388,9 +395,8 @@ def escalate(state: SupportState) -> dict:
 
         escalation_reason = ", ".join(reasons) if reasons else "complex issue requiring human review"
 
-        # Log escalation
         log = InteractionLog(
-            ticket_id=state.get("ticket_id", "UNKNOWN"),
+            ticket_id=state["ticket_id"],
             customer_id=state["customer_id"],
             role="system",
             message=f"ESCALATED: {escalation_reason}",
@@ -401,12 +407,12 @@ def escalate(state: SupportState) -> dict:
 
         escalation_message = (
             f"I've escalated your case to our specialist team. "
-            f"Your ticket ID is {state.get('ticket_id', 'pending')}. "
+            f"Your ticket ID is {state['ticket_id']}. "
             f"A human agent will contact you within 2-4 hours. "
             f"We apologize for the inconvenience."
         )
 
-        print(f"✅ Escalated: {escalation_reason}")
+        print(f"✅ Escalated: {escalation_reason} | Ticket: {state['ticket_id']}")
 
         return {
             "escalated": True,
@@ -419,25 +425,31 @@ def escalate(state: SupportState) -> dict:
 # ── Routing Functions ─────────────────────────────────────────────────────────
 
 def should_escalate(state: SupportState) -> str:
-    """Decide whether to escalate or resolve"""
-    # Escalate if:
-    # 1. Confidence is too low
+    """Decide whether to escalate or resolve.
+
+    NOTE on graph ordering — this fixes a real bug found in production
+    (ticket ID showed as "None" in escalation messages): the graph used to
+    route generate_response -> escalate -> create_ticket -> END. But
+    escalate() reads state["ticket_id"] to update/reference the ticket, and
+    create_ticket() reads state["escalated"] to set the ticket's escalated
+    flag — each node depended on something only the OTHER node produces,
+    with no edge ordering that could satisfy both at once.
+
+    Fix: create_ticket now ALWAYS runs first (it determines its own
+    escalation decision by calling this same should_escalate() function
+    internally — see create_ticket below — so the `escalated` field is
+    correct on creation). escalate() then runs conditionally AFTER, by
+    which point state["ticket_id"] is a real value, not None.
+    """
     if state.get("confidence", 1.0) < 0.4:
         return "escalate"
-
-    # 2. Customer is frustrated AND issue not resolved
     if state.get("sentiment") == "frustrated" and not state.get("resolved"):
         return "escalate"
-
-    # 3. Urgent priority
     if state.get("priority") == "urgent":
         return "escalate"
-
-    # 4. Complaint that couldn't be resolved
     if state.get("intent") == "complaint" and not state.get("resolved"):
         return "escalate"
-
-    return "create_ticket"
+    return "no_escalate"
 
 # ── Build Graph ───────────────────────────────────────────────────────────────
 
@@ -460,20 +472,40 @@ def build_support_agent():
     graph.add_edge("analyze_intent", "search_kb")
     graph.add_edge("search_kb", "generate_response")
 
-    # Conditional routing after response
+    # create_ticket ALWAYS runs right after generate_response — it computes
+    # its own escalation decision internally (see create_ticket docstring)
+    # so the ticket row is correct regardless of which path comes next.
+    graph.add_edge("generate_response", "create_ticket")
+
+    # AFTER the ticket exists (with a real ticket_id), conditionally route
+    # to escalate — which now has a real ID to put in the customer message,
+    # instead of "None".
     graph.add_conditional_edges(
-        "generate_response",
+        "create_ticket",
         should_escalate,
         {
             "escalate": "escalate",
-            "create_ticket": "create_ticket"
+            "no_escalate": END
         }
     )
 
-    graph.add_edge("escalate", "create_ticket")
-    graph.add_edge("create_ticket", END)
+    graph.add_edge("escalate", END)
 
-    # SQLite checkpointer for persistence
+    # SQLite checkpointer for persistence.
+    # IMPORTANT: SqliteSaver.from_conn_string() returns a context manager
+    # (_GeneratorContextManager), not a usable saver instance — calling
+    # graph.compile(checkpointer=that) raises:
+    #   TypeError: Invalid checkpointer provided. Expected an instance of
+    #   `BaseCheckpointSaver`, `True`, `False`, or `None`.
+    # This is a known breaking change in recent langgraph-checkpoint-sqlite
+    # versions (see langchain-ai/langgraph#2042 and #1262). The `with` form
+    # only works for short-lived scripts where the graph runs entirely
+    # inside the `with` block — it doesn't work here because this module
+    # builds the agent once at import time and FastAPI keeps using it
+    # across many requests.
+    # Fix: open the raw sqlite3 connection ourselves (check_same_thread=False
+    # because FastAPI may call this from different threads) and pass the
+    # connection directly to SqliteSaver(), bypassing the context manager.
     import sqlite3
     os.makedirs("data", exist_ok=True)
 
