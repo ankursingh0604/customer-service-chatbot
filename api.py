@@ -155,7 +155,7 @@ async def chat(request: ChatRequest):
         session_id=session_id
     )
 
-# ── Ticket Endpoints ──────────────────────────────────────────────────────────
+#Ticket Endpoints
 
 def verify_staff_key(x_staff_key: Optional[str] = Header(None)):
     """Separate auth tier — GET /tickets (full list), PATCH /tickets/{id}, and
